@@ -1,6 +1,14 @@
-import { PDFDocument, StandardFonts, rgb, type PDFImage } from "pdf-lib";
-import type { Annotation } from "./types";
+import {
+  PDFDocument,
+  StandardFonts,
+  rgb,
+  BlendMode,
+  LineCapStyle,
+  type PDFImage,
+} from "pdf-lib";
+import type { Annotation, InkStroke } from "./types";
 import { annotationToPdfRect, textBaselineY, hexToRgb01 } from "./coords";
+import { pointsToSvgPath } from "./ink";
 
 /** Matches Tailwind's `leading-tight` used by the on-screen overlay. */
 const LINE_HEIGHT = 1.25;
@@ -17,7 +25,8 @@ const LINE_HEIGHT = 1.25;
  */
 export async function bakeAnnotations(
   pdfBytes: Uint8Array,
-  annotations: Annotation[]
+  annotations: Annotation[],
+  strokes: InkStroke[] = []
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
   const font = await doc.embedFont(StandardFonts.Helvetica);
@@ -63,6 +72,29 @@ export async function bakeAnnotations(
         height: fitted.height,
       });
     }
+  }
+
+  // ---- freehand ink strokes ----
+  // Stroke points are stored in PDF points with a top-left origin (SVG-style,
+  // y down). drawSvgPath interprets path coordinates exactly that way,
+  // relative to the (x, y) origin you give it — so anchoring the origin at
+  // the page's top-left corner (x: 0, y: pageHeight) means the SAME path
+  // string used on screen embeds with zero coordinate math.
+  for (const stroke of strokes) {
+    const page = pages[stroke.pageIndex];
+    if (!page || stroke.points.length === 0) continue;
+    const { r, g, b } = hexToRgb01(stroke.color);
+
+    page.drawSvgPath(pointsToSvgPath(stroke.points), {
+      x: 0,
+      y: page.getSize().height,
+      borderColor: rgb(r, g, b),
+      borderWidth: stroke.width,
+      borderOpacity: stroke.opacity,
+      borderLineCap: LineCapStyle.Round,
+      // Multiply lets text show through highlighter ink in any PDF viewer.
+      blendMode: stroke.blend === "multiply" ? BlendMode.Multiply : BlendMode.Normal,
+    });
   }
 
   return doc.save();

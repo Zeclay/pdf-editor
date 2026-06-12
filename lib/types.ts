@@ -40,3 +40,32 @@ export interface PageDimensions {
   width: number;
   height: number;
 }
+
+// ---------------------------------------------------------------------------
+// Freehand drawing (ink)
+// ---------------------------------------------------------------------------
+
+export type DrawTool = "pen" | "highlighter" | "eraser";
+
+export interface InkPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * A freehand stroke. Same convention as Annotation: points live in
+ * **PDF points with a top-left origin**, captured as `px / scale` while
+ * drawing, so they're zoom-independent and export needs no rescaling.
+ */
+export interface InkStroke {
+  id: string;
+  pageIndex: number;
+  points: InkPoint[];
+  color: string; // hex
+  /** Stroke width in PDF points */
+  width: number;
+  /** 0..1 — highlighter is translucent */
+  opacity: number;
+  /** "multiply" keeps text readable under highlighter ink in the final PDF */
+  blend: "normal" | "multiply";
+}

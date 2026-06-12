@@ -14,11 +14,21 @@ import {
   ZoomIn,
   ZoomOut,
   Loader2,
+  Pencil,
+  Highlighter,
+  Eraser,
+  Undo2,
 } from "lucide-react";
 import DraggableOverlay from "./DraggableOverlay";
+import DrawingLayer from "./DrawingLayer";
 import SignatureModal from "./SignatureModal";
 import SplitModal from "./SplitModal";
-import type { Annotation, PageDimensions } from "@/lib/types";
+import type {
+  Annotation,
+  DrawTool,
+  InkStroke,
+  PageDimensions,
+} from "@/lib/types";
 import { getScale, newId } from "@/lib/coords";
 import {
   bakeAnnotations,
@@ -36,6 +46,13 @@ pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 const BASE_PAGE_WIDTH = 800;
 const THUMB_WIDTH = 110;
 
+const PEN_COLORS = ["#111827", "#1d4ed8", "#b91c1c"];
+const HIGHLIGHT_COLORS = ["#facc15", "#4ade80", "#f472b6"];
+
+/** Stroke width ranges in PDF points */
+const PEN_WIDTH_RANGE = { min: 1, max: 10, default: 2 };
+const HIGHLIGHT_WIDTH_RANGE = { min: 6, max: 24, default: 12 };
+
 export default function PdfEditor() {
   // ---- document state ----
   // pdfBytes is the single source of truth (survives merges / page deletes).
@@ -52,6 +69,32 @@ export default function PdfEditor() {
   const [zoom, setZoom] = useState(1);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ---- freehand drawing state ----
+  const [strokes, setStrokes] = useState<InkStroke[]>([]);
+  const [drawTool, setDrawTool] = useState<DrawTool | null>(null);
+  const [penColor, setPenColor] = useState(PEN_COLORS[2]);
+  const [highlightColor, setHighlightColor] = useState(HIGHLIGHT_COLORS[0]);
+  const [penWidth, setPenWidth] = useState(PEN_WIDTH_RANGE.default);
+  const [highlightWidth, setHighlightWidth] = useState(
+    HIGHLIGHT_WIDTH_RANGE.default
+  );
+
+  // Style for NEW strokes, resolved from the active tool.
+  const strokeStyle =
+    drawTool === "highlighter"
+      ? {
+          color: highlightColor,
+          width: highlightWidth,
+          opacity: 0.45,
+          blend: "multiply" as const,
+        }
+      : { color: penColor, width: penWidth, opacity: 1, blend: "normal" as const };
+
+  const toggleDrawTool = (tool: DrawTool) => {
+    setDrawTool((t) => (t === tool ? null : tool));
+    setSelectedId(null); // draw mode covers the annotation boxes
+  };
 
   // pdf.js TRANSFERS ArrayBuffers to its worker (postMessage), detaching them.
   // We render two <Document>s (thumbnails + main), so a shared { data } object
@@ -120,12 +163,19 @@ export default function PdfEditor() {
         setNumPages(0); // see loadFiles: avoid stale page-count race
         setPdfBytes(bytes);
         setPageDims({});
-        // Drop annotations on the deleted page, shift later pages up by one.
+        // Drop annotations/strokes on the deleted page, shift later pages up.
         setAnnotations((prev) =>
           prev
             .filter((a) => a.pageIndex !== pageIndex)
             .map((a) =>
               a.pageIndex > pageIndex ? { ...a, pageIndex: a.pageIndex - 1 } : a
+            )
+        );
+        setStrokes((prev) =>
+          prev
+            .filter((s) => s.pageIndex !== pageIndex)
+            .map((s) =>
+              s.pageIndex > pageIndex ? { ...s, pageIndex: s.pageIndex - 1 } : s
             )
         );
         setActivePage((p) => Math.max(0, Math.min(p, numPages - 2)));
@@ -230,12 +280,12 @@ export default function PdfEditor() {
     if (!pdfBytes) return;
     setIsBusy(true);
     try {
-      const bytes = await bakeAnnotations(pdfBytes, annotations);
+      const bytes = await bakeAnnotations(pdfBytes, annotations, strokes);
       downloadBytes(bytes, `${baseName(fileName)}-final.pdf`);
     } finally {
       setIsBusy(false);
     }
-  }, [pdfBytes, annotations, fileName]);
+  }, [pdfBytes, annotations, strokes, fileName]);
 
   // =====================================================================
   // Render
@@ -318,6 +368,81 @@ export default function PdfEditor() {
           icon={<Scissors size={16} />}
           label="Split"
           onClick={() => setShowSplitModal(true)}
+        />
+
+        <div className="mx-3 h-5 w-px bg-gray-200" />
+
+        {/* ---- draw tools ---- */}
+        <ToolbarButton
+          icon={<Pencil size={16} />}
+          label="Draw"
+          active={drawTool === "pen"}
+          onClick={() => toggleDrawTool("pen")}
+        />
+        <ToolbarButton
+          icon={<Highlighter size={16} />}
+          label="Highlight"
+          active={drawTool === "highlighter"}
+          onClick={() => toggleDrawTool("highlighter")}
+        />
+        <ToolbarButton
+          icon={<Eraser size={16} />}
+          label=""
+          active={drawTool === "eraser"}
+          onClick={() => toggleDrawTool("eraser")}
+        />
+        {(drawTool === "pen" || drawTool === "highlighter") && (
+          <div className="ml-1 flex items-center gap-1.5">
+            {(drawTool === "pen" ? PEN_COLORS : HIGHLIGHT_COLORS).map((c) => {
+              const current = drawTool === "pen" ? penColor : highlightColor;
+              const setColor = drawTool === "pen" ? setPenColor : setHighlightColor;
+              return (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => setColor(c)}
+                  className={`h-5 w-5 rounded-full border-2 ${
+                    current === c ? "border-blue-500" : "border-transparent"
+                  }`}
+                  style={{ backgroundColor: c }}
+                />
+              );
+            })}
+
+            {/* stroke width */}
+            <input
+              type="range"
+              title="Stroke width"
+              min={drawTool === "pen" ? PEN_WIDTH_RANGE.min : HIGHLIGHT_WIDTH_RANGE.min}
+              max={drawTool === "pen" ? PEN_WIDTH_RANGE.max : HIGHLIGHT_WIDTH_RANGE.max}
+              step={1}
+              value={drawTool === "pen" ? penWidth : highlightWidth}
+              onChange={(e) =>
+                (drawTool === "pen" ? setPenWidth : setHighlightWidth)(
+                  Number(e.target.value)
+                )
+              }
+              className="ml-2 h-1 w-20 cursor-pointer accent-blue-600"
+            />
+            {/* live preview dot at the current size/color */}
+            <span className="flex w-7 items-center justify-center">
+              <span
+                className="rounded-full"
+                style={{
+                  width: Math.min(strokeStyle.width, 24),
+                  height: Math.min(strokeStyle.width, 24),
+                  backgroundColor: strokeStyle.color,
+                  opacity: strokeStyle.opacity,
+                }}
+              />
+            </span>
+          </div>
+        )}
+        <ToolbarButton
+          icon={<Undo2 size={16} />}
+          label=""
+          disabled={strokes.length === 0}
+          onClick={() => setStrokes((prev) => prev.slice(0, -1))}
         />
 
         <div className="mx-3 h-5 w-px bg-gray-200" />
@@ -447,6 +572,23 @@ export default function PdfEditor() {
                       )
                     }
                   />
+                  {/* Freehand ink layer (above page, below boxes when idle) */}
+                  {dims && (
+                    <DrawingLayer
+                      pageIndex={i}
+                      scale={scale}
+                      strokes={strokes.filter((s) => s.pageIndex === i)}
+                      tool={drawTool}
+                      color={strokeStyle.color}
+                      strokeWidth={strokeStyle.width}
+                      opacity={strokeStyle.opacity}
+                      blend={strokeStyle.blend}
+                      onAddStroke={(s) => setStrokes((prev) => [...prev, s])}
+                      onDeleteStroke={(id) =>
+                        setStrokes((prev) => prev.filter((s) => s.id !== id))
+                      }
+                    />
+                  )}
                   {/* Annotation layer for this page */}
                   {dims &&
                     annotations
@@ -495,16 +637,25 @@ function ToolbarButton({
   icon,
   label,
   onClick,
+  active = false,
+  disabled = false,
 }: {
   icon: React.ReactNode;
   label: string;
   onClick: () => void;
+  active?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 hover:bg-gray-100"
+      disabled={disabled}
+      className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-35 ${
+        active
+          ? "bg-blue-100 text-blue-700"
+          : "text-gray-700 hover:bg-gray-100"
+      }`}
     >
       {icon}
       {label && <span>{label}</span>}
