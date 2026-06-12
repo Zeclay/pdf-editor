@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+html,
+body {
+  height: 100%;
+  background-color: #f3f4f6;
+}
+
+/* react-pdf page canvas should never exceed its wrapper */
+.react-pdf__Page__canvas {
+  display: block;
+}
