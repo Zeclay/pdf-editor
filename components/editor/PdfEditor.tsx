@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import { PDFDocument } from "pdf-lib";
 import {
@@ -192,6 +192,9 @@ export default function PdfEditor() {
   const addText = useCallback(() => {
     const dims = pageDims[activePage];
     if (!dims) return;
+    // Exit draw mode: its full-page overlay sits above the Rnd boxes
+    // and would swallow every click on the new annotation.
+    setDrawTool(null);
     const ann: Annotation = {
       id: newId(),
       type: "text",
@@ -215,6 +218,7 @@ export default function PdfEditor() {
     (dataUrl: string, aspect: number) => {
       const dims = pageDims[activePage];
       if (!dims) return;
+      setDrawTool(null); // see addText
       const width = 200; // points
       const height = Math.min(
         width / (aspect > 0 ? aspect : 2.5),
@@ -248,6 +252,36 @@ export default function PdfEditor() {
     setAnnotations((prev) => prev.filter((a) => a.id !== id));
     setSelectedId((sel) => (sel === id ? null : sel));
   }, []);
+
+  // =====================================================================
+  // Keyboard shortcuts
+  // =====================================================================
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Never hijack keys while the user is typing (text box, range input…)
+      const t = e.target as HTMLElement;
+      if (
+        t.tagName === "TEXTAREA" ||
+        t.tagName === "INPUT" ||
+        t.isContentEditable
+      )
+        return;
+
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
+        e.preventDefault();
+        deleteAnnotation(selectedId);
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+        // Undo last drawn stroke (same as the toolbar undo button)
+        e.preventDefault();
+        setStrokes((prev) => prev.slice(0, -1));
+      } else if (e.key === "Escape") {
+        setSelectedId(null);
+        setDrawTool(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedId, deleteAnnotation]);
 
   // =====================================================================
   // Modals + export
@@ -556,7 +590,7 @@ export default function PdfEditor() {
                     width={renderedWidth}
                     renderTextLayer={false}
                     renderAnnotationLayer={false}
-                    onLoadSuccess={(page) =>
+                    onLoadSuccess={(page) => {
                       setPageDims((prev) =>
                         prev[i]
                           ? prev
@@ -569,8 +603,8 @@ export default function PdfEditor() {
                                 height: page.originalHeight,
                               },
                             }
-                      )
-                    }
+                      );
+                    }}
                   />
                   {/* Freehand ink layer (above page, below boxes when idle) */}
                   {dims && (

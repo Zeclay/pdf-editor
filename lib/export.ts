@@ -29,7 +29,7 @@ export async function bakeAnnotations(
   strokes: InkStroke[] = []
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
-  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const font = await loadAnnotationFont(doc);
   const pages = doc.getPages();
 
   // Embed each unique signature PNG only once, even if placed multiple times.
@@ -48,13 +48,19 @@ export async function bakeAnnotations(
       const firstBaseline = textBaselineY(ann, pageHeight);
 
       text.split("\n").forEach((line, i) => {
-        page.drawText(line, {
-          x: ann.x,
-          y: firstBaseline - i * fontSize * LINE_HEIGHT,
-          size: fontSize,
-          font,
-          color: rgb(r, g, b),
-        });
+        try {
+          page.drawText(line, {
+            x: ann.x,
+            y: firstBaseline - i * fontSize * LINE_HEIGHT,
+            size: fontSize,
+            font,
+            color: rgb(r, g, b),
+          });
+        } catch (err) {
+          // Standard fonts can't encode non-Latin text (e.g. Thai).
+          // Provide public/fonts/custom.ttf to fix — see loadAnnotationFont.
+          console.warn(`Skipped un-encodable text line: "${line}"`, err);
+        }
       });
     } else if (ann.type === "signature" && ann.dataUrl) {
       let image = imageCache.get(ann.dataUrl);
@@ -146,3 +152,26 @@ export function downloadBytes(bytes: Uint8Array, filename: string): void {
 
 export const baseName = (filename: string): string =>
   filename.replace(/\.pdf$/i, "");
+
+/**
+ * Font used for all baked text.
+ *
+ * pdf-lib's standard fonts (Helvetica) only encode WinAnsi/Latin characters —
+ * Thai or other non-Latin text would throw. If a Unicode TTF exists at
+ * public/fonts/custom.ttf (e.g. Sarabun or Noto Sans Thai), it's embedded
+ * (subsetted, so only used glyphs ship in the PDF). Otherwise falls back to
+ * Helvetica.
+ */
+async function loadAnnotationFont(doc: PDFDocument) {
+  try {
+    const res = await fetch("/fonts/custom.ttf");
+    if (res.ok) {
+      const fontkit = (await import("@pdf-lib/fontkit")).default;
+      doc.registerFontkit(fontkit);
+      return await doc.embedFont(await res.arrayBuffer(), { subset: true });
+    }
+  } catch {
+    // fall through to Helvetica
+  }
+  return doc.embedFont(StandardFonts.Helvetica);
+}

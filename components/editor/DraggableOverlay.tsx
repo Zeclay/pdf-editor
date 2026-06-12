@@ -2,9 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Rnd } from "react-rnd";
-import { Trash2, GripVertical } from "lucide-react";
+import { Trash2, GripVertical, Minus, Plus } from "lucide-react";
 import type { Annotation } from "@/lib/types";
 import { ptToPx, pxToPt } from "@/lib/coords";
+
+const TEXT_COLORS = ["#111827", "#1d4ed8", "#b91c1c", "#15803d"];
+const FONT_SIZE = { min: 8, max: 96, step: 2 };
 
 interface DraggableOverlayProps {
   annotation: Annotation;
@@ -135,10 +138,77 @@ export default function DraggableOverlay({
 
         {/* ---- controls (visible when selected/hovered) ---- */}
         <div
-          className={`absolute -top-7 right-0 flex items-center gap-1 rounded bg-gray-900 px-1 py-0.5 ${
+          className={`absolute -top-7 right-0 items-center gap-1 whitespace-nowrap rounded bg-gray-900 px-1 py-0.5 ${
             isSelected ? "flex" : "hidden group-hover:flex"
           }`}
+          // keep clicks on the control bar from starting an Rnd drag
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
         >
+          {isText && isSelected && (
+            <>
+              {/* font size stepper */}
+              <button
+                type="button"
+                title="Smaller text"
+                className="rounded p-0.5 text-gray-300 hover:bg-gray-700"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onChange(annotation.id, {
+                    fontSize: Math.max(
+                      FONT_SIZE.min,
+                      (annotation.fontSize ?? 14) - FONT_SIZE.step
+                    ),
+                  });
+                }}
+              >
+                <Minus size={12} />
+              </button>
+              <span className="w-6 text-center text-[11px] tabular-nums text-gray-200">
+                {annotation.fontSize ?? 14}
+              </span>
+              <button
+                type="button"
+                title="Larger text"
+                className="rounded p-0.5 text-gray-300 hover:bg-gray-700"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onChange(annotation.id, {
+                    fontSize: Math.min(
+                      FONT_SIZE.max,
+                      (annotation.fontSize ?? 14) + FONT_SIZE.step
+                    ),
+                  });
+                }}
+              >
+                <Plus size={12} />
+              </button>
+
+              <span className="mx-0.5 h-3.5 w-px bg-gray-700" />
+
+              {/* text color swatches */}
+              {TEXT_COLORS.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  title={c}
+                  className={`h-3.5 w-3.5 rounded-full border ${
+                    (annotation.color ?? "#111827") === c
+                      ? "border-white"
+                      : "border-transparent"
+                  }`}
+                  style={{ backgroundColor: c }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onChange(annotation.id, { color: c });
+                  }}
+                />
+              ))}
+
+              <span className="mx-0.5 h-3.5 w-px bg-gray-700" />
+            </>
+          )}
+
           <GripVertical size={12} className="text-gray-400" />
           <button
             type="button"
