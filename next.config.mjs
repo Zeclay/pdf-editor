@@ -1,5 +1,7 @@
 /** @type {import('next').NextConfig} */
 
+const isDev = process.env.NODE_ENV === "development";
+
 /**
  * Content Security Policy.
  *
@@ -7,6 +9,8 @@
  *   script-src  'unsafe-inline' — required by Next.js App Router (inline
  *               hydration bootstrap). For a stricter policy, implement
  *               nonce-based CSP via Next.js middleware instead.
+ *   script-src  'unsafe-eval' (dev only) — webpack HMR and React Fast Refresh
+ *               use eval() during development. Never included in production.
  *   script-src  blob: — pdfjs-dist spins up its worker as a Blob URL.
  *   worker-src  blob: — same reason.
  *   img-src     data: blob: — signature PNG data-URLs + react-pdf page blobs.
@@ -15,7 +19,7 @@
  */
 const ContentSecurityPolicy = `
   default-src 'self';
-  script-src  'self' 'unsafe-inline' blob:;
+  script-src  'self' 'unsafe-inline' ${isDev ? "'unsafe-eval'" : ""} blob:;
   style-src   'self' 'unsafe-inline';
   img-src     'self' data: blob:;
   font-src    'self';
