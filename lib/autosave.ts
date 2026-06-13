@@ -10,6 +10,9 @@
  */
 import type { Annotation, InkStroke } from "./types";
 
+/** Skip autosave for PDFs larger than this to avoid filling IndexedDB quota. */
+const MAX_AUTOSAVE_BYTES = 50 * 1024 * 1024; // 50 MB
+
 const DB_NAME = "pdf-editor-autosave";
 const DB_VERSION = 1;
 const STORE = "session";
@@ -49,6 +52,12 @@ function openDB(): Promise<IDBDatabase> {
  * Silently swallows errors so a failing IDB never crashes the editor.
  */
 export async function saveSession(data: SessionData): Promise<void> {
+  if (data.pdfBytes.byteLength > MAX_AUTOSAVE_BYTES) {
+    console.warn(
+      `[autosave] PDF too large to autosave (${(data.pdfBytes.byteLength / 1024 / 1024).toFixed(1)} MB > ${MAX_AUTOSAVE_BYTES / 1024 / 1024} MB limit). Skipping.`
+    );
+    return;
+  }
   try {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {

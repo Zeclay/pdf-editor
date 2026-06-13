@@ -35,6 +35,7 @@ import { getScale, newId } from "@/lib/coords";
 import { bakeAnnotations, extractPages, downloadBytes, baseName } from "@/lib/export";
 import { saveSession, loadSession, clearSession } from "@/lib/autosave";
 import type { SessionData } from "@/lib/autosave";
+import { validatePdfFile } from "@/lib/validate";
 
 pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
@@ -91,6 +92,11 @@ export default function PdfEditor() {
   // ---- page reorder drag ----
   const dragPageIdx = useRef<number | null>(null);
   const [thumbOverIdx, setThumbOverIdx] = useState<number | null>(null);
+
+  // ---- validation / warnings ----
+  const [fileError, setFileError] = useState<string | null>(null);
+  /** True when the loaded PDF had its encryption flag set (password-protected). */
+  const [wasEncrypted, setWasEncrypted] = useState(false);
 
   // ---- autosave ----
   const [pendingSession, setPendingSession] = useState<SessionData | null>(null);
@@ -187,28 +193,60 @@ export default function PdfEditor() {
   // =========================================================================
   const loadFiles = useCallback(
     async (files: File[]) => {
-      const pdfs = files.filter((f) => f.type === "application/pdf");
-      if (pdfs.length === 0) return;
+      // Filter to PDF files first, then validate each one.
+      const candidates = files.filter((f) => f.type === "application/pdf");
+      if (candidates.length === 0) return;
+
+      setFileError(null);
       setIsBusy(true);
       try {
+        // Validate every file before touching pdf-lib.
+        for (const f of candidates) {
+          const result = await validatePdfFile(f);
+          if (!result.ok) {
+            setFileError(result.error ?? "Invalid file.");
+            return;
+          }
+        }
+
         let bytes: Uint8Array;
-        if (pdfs.length === 1 && !pdfBytes) {
-          bytes = new Uint8Array(await pdfs[0].arrayBuffer());
+        let foundEncrypted = false;
+
+        if (candidates.length === 1 && !pdfBytes) {
+          bytes = new Uint8Array(await candidates[0].arrayBuffer());
+          // Detect encryption: try loading without ignoreEncryption flag.
+          try {
+            await PDFDocument.load(bytes);
+          } catch {
+            // pdf-lib throws when it hits an encrypted document.
+            foundEncrypted = true;
+          }
+          // Re-load with ignoreEncryption so editing still works.
+          await PDFDocument.load(bytes, { ignoreEncryption: true });
         } else {
           const merged = await PDFDocument.create();
           const sources: (Uint8Array | ArrayBuffer)[] = [];
           if (pdfBytes) sources.push(pdfBytes);
-          for (const f of pdfs) sources.push(await f.arrayBuffer());
+          for (const f of candidates) sources.push(await f.arrayBuffer());
           for (const src of sources) {
-            const doc = await PDFDocument.load(src, { ignoreEncryption: true });
+            const srcBytes = src instanceof ArrayBuffer ? new Uint8Array(src) : src;
+            // Detect encryption on each new file.
+            try {
+              await PDFDocument.load(srcBytes);
+            } catch {
+              foundEncrypted = true;
+            }
+            const doc = await PDFDocument.load(srcBytes, { ignoreEncryption: true });
             const pages = await merged.copyPages(doc, doc.getPageIndices());
             pages.forEach((p) => merged.addPage(p));
           }
           bytes = await merged.save();
         }
+
+        setWasEncrypted(foundEncrypted);
         setNumPages(0);
         setPdfBytes(bytes);
-        if (!pdfBytes) setFileName(pdfs[0].name);
+        if (!pdfBytes) setFileName(candidates[0].name);
         setPageDims({});
         setSelectedId(null);
         setPendingSession(null);
@@ -448,6 +486,15 @@ export default function PdfEditor() {
           </div>
         )}
 
+        {/* ---- file validation error ---- */}
+        {fileError && (
+          <div className="flex w-full max-w-xl items-center gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm">
+            <AlertCircle size={16} className="shrink-0 text-red-500" />
+            <span className="flex-1 text-red-700">{fileError}</span>
+            <button type="button" onClick={() => setFileError(null)} className="text-red-400 hover:text-red-600">✕</button>
+          </div>
+        )}
+
         {/* ---- drop zone ---- */}
         <div
           className={`flex w-full max-w-xl cursor-pointer flex-col items-center gap-4 rounded-2xl border-2 border-dashed p-16 text-center transition-colors ${
@@ -593,6 +640,15 @@ export default function PdfEditor() {
           Finalize &amp; Download
         </button>
       </header>
+
+      {/* encryption warning */}
+      {wasEncrypted && (
+        <div className="flex items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-xs text-amber-800">
+          <AlertCircle size={13} className="shrink-0" />
+          This PDF was password-protected. The password has been bypassed for editing — the exported file will not be encrypted.
+          <button type="button" onClick={() => setWasEncrypted(false)} className="ml-auto text-amber-500 hover:text-amber-700">✕</button>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         {/* ===================== Thumbnail sidebar ===================== */}
