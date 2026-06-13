@@ -1,8 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { X, Scissors, Loader2 } from "lucide-react";
 import { parsePageRanges } from "@/lib/export";
+import { useFocusTrap } from "@/lib/focus-trap";
 
 interface SplitModalProps {
   numPages: number;
@@ -30,44 +31,69 @@ export default function SplitModal({
 
   const valid = "indices" in parsed;
 
+  // Focus trap: keeps Tab/Shift+Tab cycling inside the dialog while open.
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef);
+
+  // Stable IDs for aria-describedby on the input
+  const statusId = "split-modal-status";
+
   return (
+    /* Backdrop — click outside to close */
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       onClick={onClose}
     >
+      {/* Dialog panel */}
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="split-modal-title"
+        aria-describedby={statusId}
         className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-base font-semibold text-gray-800">
+          <h2 id="split-modal-title" className="text-base font-semibold text-gray-800">
             Export page range
           </h2>
           <button
             type="button"
+            aria-label="Close export dialog"
             onClick={onClose}
             className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
           >
-            <X size={18} />
+            <X size={18} aria-hidden="true" />
           </button>
         </div>
 
-        <label className="mb-1 block text-sm text-gray-600">
+        <label htmlFor="split-range-input" className="mb-1 block text-sm text-gray-600">
           Pages to export (document has {numPages} page{numPages > 1 ? "s" : ""})
         </label>
         <input
+          id="split-range-input"
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="e.g. 1-3, 5, 8-10"
           autoFocus
+          aria-describedby={statusId}
+          aria-invalid={!valid}
           className={`w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2 ${
             valid
               ? "border-gray-300 focus:ring-blue-200"
               : "border-red-400 focus:ring-red-200"
           }`}
         />
-        <p className={`mt-1.5 h-5 text-xs ${valid ? "text-gray-500" : "text-red-600"}`}>
+        {/* aria-live so screen readers announce validation changes as the user types */}
+        <p
+          id={statusId}
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className={`mt-1.5 h-5 text-xs ${valid ? "text-gray-500" : "text-red-600"}`}
+        >
           {valid
             ? `${parsed.indices.length} page${parsed.indices.length > 1 ? "s" : ""} selected`
             : parsed.error}
@@ -88,9 +114,9 @@ export default function SplitModal({
             className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {isBusy ? (
-              <Loader2 size={14} className="animate-spin" />
+              <Loader2 size={14} className="animate-spin" aria-hidden="true" />
             ) : (
-              <Scissors size={14} />
+              <Scissors size={14} aria-hidden="true" />
             )}
             Export PDF
           </button>
