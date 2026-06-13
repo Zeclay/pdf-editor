@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, degrees } from "pdf-lib";
 import {
   FileUp,
   FilePlus2,
@@ -21,44 +21,33 @@ import {
   Redo2,
   PanelLeftClose,
   PanelLeftOpen,
+  RotateCcw,
+  RotateCw,
+  CheckCircle2,
+  AlertCircle,
 } from "lucide-react";
 import DraggableOverlay from "./DraggableOverlay";
 import DrawingLayer from "./DrawingLayer";
 import SignatureModal from "./SignatureModal";
 import SplitModal from "./SplitModal";
-import type {
-  Annotation,
-  DrawTool,
-  InkStroke,
-  PageDimensions,
-} from "@/lib/types";
+import type { Annotation, DrawTool, InkStroke, PageDimensions } from "@/lib/types";
 import { getScale, newId } from "@/lib/coords";
-import {
-  bakeAnnotations,
-  extractPages,
-  downloadBytes,
-  baseName,
-} from "@/lib/export";
+import { bakeAnnotations, extractPages, downloadBytes, baseName } from "@/lib/export";
+import { saveSession, loadSession, clearSession } from "@/lib/autosave";
+import type { SessionData } from "@/lib/autosave";
 
-// pdf.js worker — served as a plain static file from /public, copied there
-// from the installed pdfjs-dist by scripts/copy-pdf-worker.mjs (predev/prebuild).
 pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
-/** Base rendered page width in CSS px at zoom = 1 */
 const BASE_PAGE_WIDTH = 800;
 const THUMB_WIDTH = 110;
 const MAX_HISTORY = 30;
+const AUTOSAVE_DELAY_MS = 1500;
 
 const PEN_COLORS = ["#111827", "#1d4ed8", "#b91c1c"];
 const HIGHLIGHT_COLORS = ["#facc15", "#4ade80", "#f472b6"];
-
-/** Stroke width ranges in PDF points */
 const PEN_WIDTH_RANGE = { min: 1, max: 10, default: 2 };
 const HIGHLIGHT_WIDTH_RANGE = { min: 6, max: 24, default: 12 };
 
-// ---------------------------------------------------------------------------
-// History snapshot — everything needed to fully restore editor state
-// ---------------------------------------------------------------------------
 interface HistorySnapshot {
   pdfBytes: Uint8Array | null;
   annotations: Annotation[];
@@ -81,19 +70,15 @@ export default function PdfEditor() {
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // ---- freehand drawing state ----
+  // ---- freehand drawing ----
   const [strokes, setStrokes] = useState<InkStroke[]>([]);
   const [drawTool, setDrawTool] = useState<DrawTool | null>(null);
   const [penColor, setPenColor] = useState(PEN_COLORS[2]);
   const [highlightColor, setHighlightColor] = useState(HIGHLIGHT_COLORS[0]);
   const [penWidth, setPenWidth] = useState(PEN_WIDTH_RANGE.default);
-  const [highlightWidth, setHighlightWidth] = useState(
-    HIGHLIGHT_WIDTH_RANGE.default
-  );
+  const [highlightWidth, setHighlightWidth] = useState(HIGHLIGHT_WIDTH_RANGE.default);
 
   // ---- undo / redo ----
-  // Stacks live in refs (no re-render on push/pop); canUndo/canRedo are
-  // plain state so toolbar buttons react immediately.
   const undoStack = useRef<HistorySnapshot[]>([]);
   const redoStack = useRef<HistorySnapshot[]>([]);
   const [canUndo, setCanUndo] = useState(false);
@@ -101,22 +86,23 @@ export default function PdfEditor() {
 
   // ---- sidebar ----
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  // One ref per thumbnail div — used for auto-scroll.
   const thumbRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
-  // ---- page reorder drag state ----
+  // ---- page reorder drag ----
   const dragPageIdx = useRef<number | null>(null);
   const [thumbOverIdx, setThumbOverIdx] = useState<number | null>(null);
 
-  // Style for NEW strokes, resolved from the active tool.
+  // ---- autosave ----
+  const [pendingSession, setPendingSession] = useState<SessionData | null>(null);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // =========================================================================
+  // Derived
+  // =========================================================================
   const strokeStyle =
     drawTool === "highlighter"
-      ? {
-          color: highlightColor,
-          width: highlightWidth,
-          opacity: 0.45,
-          blend: "multiply" as const,
-        }
+      ? { color: highlightColor, width: highlightWidth, opacity: 0.45, blend: "multiply" as const }
       : { color: penColor, width: penWidth, opacity: 1, blend: "normal" as const };
 
   const toggleDrawTool = (tool: DrawTool) => {
@@ -126,84 +112,79 @@ export default function PdfEditor() {
 
   // Blob prevents DataCloneError when two <Document>s share the same buffer.
   const documentFile = useMemo(
-    () =>
-      pdfBytes
-        ? new Blob([pdfBytes.slice().buffer], { type: "application/pdf" })
-        : null,
+    () => pdfBytes ? new Blob([pdfBytes.slice().buffer], { type: "application/pdf" }) : null,
     [pdfBytes]
   );
 
-  // ===========================================================================
-  // History helpers
-  // ===========================================================================
-
-  /**
-   * Call BEFORE any mutating operation to snapshot the current state.
-   * Any new action clears the redo stack (standard linear undo model).
-   */
+  // =========================================================================
+  // History
+  // =========================================================================
   const pushHistory = useCallback(() => {
-    undoStack.current = [
-      ...undoStack.current,
-      { pdfBytes, annotations, strokes },
-    ].slice(-MAX_HISTORY);
+    undoStack.current = [...undoStack.current, { pdfBytes, annotations, strokes }].slice(-MAX_HISTORY);
     redoStack.current = [];
     setCanUndo(true);
     setCanRedo(false);
   }, [pdfBytes, annotations, strokes]);
 
   const undo = useCallback(() => {
-    const snapshot = undoStack.current.pop();
-    if (!snapshot) return;
-    redoStack.current = [
-      ...redoStack.current,
-      { pdfBytes, annotations, strokes },
-    ];
-    // Only swap pdfBytes when the page structure actually changed (cheap
-    // reference comparison avoids resetting pageDims / numPages on pure
-    // annotation edits).
-    if (snapshot.pdfBytes !== pdfBytes) {
-      setNumPages(0);
-      setPdfBytes(snapshot.pdfBytes);
-      setPageDims({});
-    }
-    setAnnotations(snapshot.annotations);
-    setStrokes(snapshot.strokes);
+    const snap = undoStack.current.pop();
+    if (!snap) return;
+    redoStack.current = [...redoStack.current, { pdfBytes, annotations, strokes }];
+    if (snap.pdfBytes !== pdfBytes) { setNumPages(0); setPdfBytes(snap.pdfBytes); setPageDims({}); }
+    setAnnotations(snap.annotations);
+    setStrokes(snap.strokes);
     setCanUndo(undoStack.current.length > 0);
     setCanRedo(true);
   }, [pdfBytes, annotations, strokes]);
 
   const redo = useCallback(() => {
-    const snapshot = redoStack.current.pop();
-    if (!snapshot) return;
-    undoStack.current = [
-      ...undoStack.current,
-      { pdfBytes, annotations, strokes },
-    ].slice(-MAX_HISTORY);
-    if (snapshot.pdfBytes !== pdfBytes) {
-      setNumPages(0);
-      setPdfBytes(snapshot.pdfBytes);
-      setPageDims({});
-    }
-    setAnnotations(snapshot.annotations);
-    setStrokes(snapshot.strokes);
+    const snap = redoStack.current.pop();
+    if (!snap) return;
+    undoStack.current = [...undoStack.current, { pdfBytes, annotations, strokes }].slice(-MAX_HISTORY);
+    if (snap.pdfBytes !== pdfBytes) { setNumPages(0); setPdfBytes(snap.pdfBytes); setPageDims({}); }
+    setAnnotations(snap.annotations);
+    setStrokes(snap.strokes);
     setCanUndo(true);
     setCanRedo(redoStack.current.length > 0);
   }, [pdfBytes, annotations, strokes]);
 
-  // ===========================================================================
+  // =========================================================================
+  // Autosave: load on mount, save on change (debounced)
+  // =========================================================================
+  // 1 — check for a saved session when the component first mounts
+  useEffect(() => {
+    loadSession()
+      .then((s) => { if (s) setPendingSession(s); })
+      .catch(() => {/* ignore */});
+  }, []);
+
+  // 2 — debounced save whenever editing state changes
+  useEffect(() => {
+    if (!pdfBytes) return; // nothing to save before a file is loaded
+    setSaveStatus("saving");
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        await saveSession({ pdfBytes, annotations, strokes, fileName, savedAt: Date.now() });
+        setSaveStatus("saved");
+      } catch {
+        setSaveStatus("error");
+      }
+    }, AUTOSAVE_DELAY_MS);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+  }, [pdfBytes, annotations, strokes, fileName]);
+
+  // =========================================================================
   // Sidebar: auto-scroll active thumbnail into view
-  // ===========================================================================
+  // =========================================================================
   useEffect(() => {
     if (!sidebarOpen) return;
-    thumbRefs.current[activePage]?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-    });
+    thumbRefs.current[activePage]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [activePage, sidebarOpen]);
 
-  // ===========================================================================
-  // File management: open / merge
-  // ===========================================================================
+  // =========================================================================
+  // File management
+  // =========================================================================
   const loadFiles = useCallback(
     async (files: File[]) => {
       const pdfs = files.filter((f) => f.type === "application/pdf");
@@ -219,9 +200,7 @@ export default function PdfEditor() {
           if (pdfBytes) sources.push(pdfBytes);
           for (const f of pdfs) sources.push(await f.arrayBuffer());
           for (const src of sources) {
-            const doc = await PDFDocument.load(src, {
-              ignoreEncryption: true,
-            });
+            const doc = await PDFDocument.load(src, { ignoreEncryption: true });
             const pages = await merged.copyPages(doc, doc.getPageIndices());
             pages.forEach((p) => merged.addPage(p));
           }
@@ -232,6 +211,7 @@ export default function PdfEditor() {
         if (!pdfBytes) setFileName(pdfs[0].name);
         setPageDims({});
         setSelectedId(null);
+        setPendingSession(null);
       } finally {
         setIsBusy(false);
       }
@@ -239,52 +219,53 @@ export default function PdfEditor() {
     [pdfBytes]
   );
 
-  // ===========================================================================
-  // Page operations
-  // ===========================================================================
+  // Restore a saved session
+  const handleRestore = useCallback(() => {
+    if (!pendingSession) return;
+    setNumPages(0);
+    setPdfBytes(pendingSession.pdfBytes);
+    setAnnotations(pendingSession.annotations);
+    setStrokes(pendingSession.strokes);
+    setFileName(pendingSession.fileName);
+    setPageDims({});
+    setPendingSession(null);
+  }, [pendingSession]);
+
+  const handleDiscardSession = useCallback(() => {
+    void clearSession();
+    setPendingSession(null);
+  }, []);
+
+  // =========================================================================
+  // Page: delete
+  // =========================================================================
   const deletePage = useCallback(
     async (pageIndex: number) => {
       if (!pdfBytes || numPages <= 1) return;
       pushHistory();
       setIsBusy(true);
       try {
-        const doc = await PDFDocument.load(pdfBytes, {
-          ignoreEncryption: true,
-        });
+        const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
         doc.removePage(pageIndex);
         const bytes = await doc.save();
-        setNumPages(0);
-        setPdfBytes(bytes);
-        setPageDims({});
+        setNumPages(0); setPdfBytes(bytes); setPageDims({});
         setAnnotations((prev) =>
-          prev
-            .filter((a) => a.pageIndex !== pageIndex)
-            .map((a) =>
-              a.pageIndex > pageIndex
-                ? { ...a, pageIndex: a.pageIndex - 1 }
-                : a
-            )
+          prev.filter((a) => a.pageIndex !== pageIndex)
+              .map((a) => a.pageIndex > pageIndex ? { ...a, pageIndex: a.pageIndex - 1 } : a)
         );
         setStrokes((prev) =>
-          prev
-            .filter((s) => s.pageIndex !== pageIndex)
-            .map((s) =>
-              s.pageIndex > pageIndex
-                ? { ...s, pageIndex: s.pageIndex - 1 }
-                : s
-            )
+          prev.filter((s) => s.pageIndex !== pageIndex)
+              .map((s) => s.pageIndex > pageIndex ? { ...s, pageIndex: s.pageIndex - 1 } : s)
         );
         setActivePage((p) => Math.max(0, Math.min(p, numPages - 2)));
-      } finally {
-        setIsBusy(false);
-      }
+      } finally { setIsBusy(false); }
     },
     [pdfBytes, numPages, pushHistory]
   );
 
-  // ===========================================================================
-  // Page reorder
-  // ===========================================================================
+  // =========================================================================
+  // Page: reorder
+  // =========================================================================
   const reorderPages = useCallback(
     async (newOrder: number[]) => {
       if (!pdfBytes) return;
@@ -292,49 +273,56 @@ export default function PdfEditor() {
       setIsBusy(true);
       try {
         const bytes = await extractPages(pdfBytes, newOrder);
-        setNumPages(0);
-        setPdfBytes(bytes);
-        setPageDims({});
+        setNumPages(0); setPdfBytes(bytes); setPageDims({});
         setAnnotations((prev) =>
-          prev
-            .map((a) => ({ ...a, pageIndex: newOrder.indexOf(a.pageIndex) }))
-            .filter((a) => a.pageIndex !== -1)
+          prev.map((a) => ({ ...a, pageIndex: newOrder.indexOf(a.pageIndex) }))
+              .filter((a) => a.pageIndex !== -1)
         );
         setStrokes((prev) =>
-          prev
-            .map((s) => ({ ...s, pageIndex: newOrder.indexOf(s.pageIndex) }))
-            .filter((s) => s.pageIndex !== -1)
+          prev.map((s) => ({ ...s, pageIndex: newOrder.indexOf(s.pageIndex) }))
+              .filter((s) => s.pageIndex !== -1)
         );
-        setActivePage((p) => {
-          const next = newOrder.indexOf(p);
-          return next === -1 ? 0 : next;
-        });
-      } finally {
-        setIsBusy(false);
-      }
+        setActivePage((p) => { const n = newOrder.indexOf(p); return n === -1 ? 0 : n; });
+      } finally { setIsBusy(false); }
     },
     [pdfBytes, pushHistory]
   );
 
-  // ===========================================================================
+  // =========================================================================
+  // Page: rotate
+  // =========================================================================
+  const rotatePage = useCallback(
+    async (pageIndex: number, delta: 90 | -90) => {
+      if (!pdfBytes) return;
+      pushHistory();
+      setIsBusy(true);
+      try {
+        const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+        const page = doc.getPages()[pageIndex];
+        const current = page.getRotation().angle;
+        // Normalise to 0-359 so pdf-lib never sees negative values.
+        page.setRotation(degrees(((current + delta) % 360 + 360) % 360));
+        const bytes = await doc.save();
+        // Page dimensions swap on 90/270 — reset so react-pdf re-measures.
+        setNumPages(0); setPdfBytes(bytes); setPageDims({});
+      } finally { setIsBusy(false); }
+    },
+    [pdfBytes, pushHistory]
+  );
+
+  // =========================================================================
   // Annotations
-  // ===========================================================================
+  // =========================================================================
   const addText = useCallback(() => {
     const dims = pageDims[activePage];
     if (!dims) return;
     setDrawTool(null);
     pushHistory();
     const ann: Annotation = {
-      id: newId(),
-      type: "text",
-      pageIndex: activePage,
-      x: dims.width / 2 - 90,
-      y: dims.height / 3,
-      width: 180,
-      height: 28,
-      text: "Double-click to edit",
-      fontSize: 14,
-      color: "#111827",
+      id: newId(), type: "text", pageIndex: activePage,
+      x: dims.width / 2 - 90, y: dims.height / 3,
+      width: 180, height: 28,
+      text: "Double-click to edit", fontSize: 14, color: "#111827",
     };
     setAnnotations((prev) => [...prev, ann]);
     setSelectedId(ann.id);
@@ -347,19 +335,11 @@ export default function PdfEditor() {
       setDrawTool(null);
       pushHistory();
       const width = 200;
-      const height = Math.min(
-        width / (aspect > 0 ? aspect : 2.5),
-        dims.height / 3
-      );
+      const height = Math.min(width / (aspect > 0 ? aspect : 2.5), dims.height / 3);
       const ann: Annotation = {
-        id: newId(),
-        type: "signature",
-        pageIndex: activePage,
-        x: dims.width / 2 - width / 2,
-        y: dims.height / 2,
-        width,
-        height,
-        dataUrl,
+        id: newId(), type: "signature", pageIndex: activePage,
+        x: dims.width / 2 - width / 2, y: dims.height / 2,
+        width, height, dataUrl,
       };
       setAnnotations((prev) => [...prev, ann]);
       setSelectedId(ann.id);
@@ -370,9 +350,7 @@ export default function PdfEditor() {
   const updateAnnotation = useCallback(
     (id: string, patch: Partial<Annotation>) => {
       pushHistory();
-      setAnnotations((prev) =>
-        prev.map((a) => (a.id === id ? { ...a, ...patch } : a))
-      );
+      setAnnotations((prev) => prev.map((a) => (a.id === id ? { ...a, ...patch } : a)));
     },
     [pushHistory]
   );
@@ -386,49 +364,33 @@ export default function PdfEditor() {
     [pushHistory]
   );
 
-  // ===========================================================================
+  // =========================================================================
   // Keyboard shortcuts
-  // ===========================================================================
+  // =========================================================================
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement;
-      if (
-        t.tagName === "TEXTAREA" ||
-        t.tagName === "INPUT" ||
-        t.isContentEditable
-      )
-        return;
+      if (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable) return;
 
       if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
-        e.preventDefault();
-        deleteAnnotation(selectedId);
-      } else if (
-        (e.metaKey || e.ctrlKey) &&
-        e.shiftKey &&
-        e.key.toLowerCase() === "z"
-      ) {
-        // Ctrl+Shift+Z = Redo (common on Windows/Linux)
-        e.preventDefault();
-        redo();
+        e.preventDefault(); deleteAnnotation(selectedId);
+      } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "z") {
+        e.preventDefault(); redo();
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
-        e.preventDefault();
-        undo();
+        e.preventDefault(); undo();
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y") {
-        // Ctrl+Y = Redo (Windows convention)
-        e.preventDefault();
-        redo();
+        e.preventDefault(); redo();
       } else if (e.key === "Escape") {
-        setSelectedId(null);
-        setDrawTool(null);
+        setSelectedId(null); setDrawTool(null);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [selectedId, deleteAnnotation, undo, redo]);
 
-  // ===========================================================================
+  // =========================================================================
   // Modals + export
-  // ===========================================================================
+  // =========================================================================
   const [showSignatureModal, setShowSignatureModal] = useState(false);
   const [showSplitModal, setShowSplitModal] = useState(false);
 
@@ -440,9 +402,7 @@ export default function PdfEditor() {
         const bytes = await extractPages(pdfBytes, indices);
         downloadBytes(bytes, `${baseName(fileName)}-pages.pdf`);
         setShowSplitModal(false);
-      } finally {
-        setIsBusy(false);
-      }
+      } finally { setIsBusy(false); }
     },
     [pdfBytes, fileName]
   );
@@ -453,17 +413,42 @@ export default function PdfEditor() {
     try {
       const bytes = await bakeAnnotations(pdfBytes, annotations, strokes);
       downloadBytes(bytes, `${baseName(fileName)}-final.pdf`);
-    } finally {
-      setIsBusy(false);
-    }
+    } finally { setIsBusy(false); }
   }, [pdfBytes, annotations, strokes, fileName]);
 
-  // ===========================================================================
-  // Render
-  // ===========================================================================
+  // =========================================================================
+  // Render — upload / drop zone
+  // =========================================================================
   if (!pdfBytes) {
     return (
-      <div className="flex h-screen items-center justify-center p-8">
+      <div className="flex h-screen flex-col items-center justify-center gap-6 p-8">
+        {/* ---- autosave restore banner ---- */}
+        {pendingSession && (
+          <div className="flex w-full max-w-xl items-center gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm shadow-sm">
+            <CheckCircle2 size={18} className="shrink-0 text-blue-500" />
+            <div className="flex-1 text-gray-700">
+              <span className="font-semibold">{pendingSession.fileName}</span> — autosaved{" "}
+              {new Date(pendingSession.savedAt).toLocaleString()}
+            </div>
+            <button
+              type="button"
+              onClick={handleRestore}
+              className="rounded-lg bg-blue-600 px-3 py-1 font-medium text-white hover:bg-blue-700"
+            >
+              Restore
+            </button>
+            <button
+              type="button"
+              onClick={handleDiscardSession}
+              className="rounded p-1 text-gray-400 hover:text-gray-600"
+              title="Discard saved session"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* ---- drop zone ---- */}
         <div
           className={`flex w-full max-w-xl cursor-pointer flex-col items-center gap-4 rounded-2xl border-2 border-dashed p-16 text-center transition-colors ${
             isDragOver
@@ -471,10 +456,7 @@ export default function PdfEditor() {
               : "border-gray-300 bg-white hover:border-blue-400"
           }`}
           onClick={() => fileInputRef.current?.click()}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setIsDragOver(true);
-          }}
+          onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
           onDragLeave={() => setIsDragOver(false)}
           onDrop={(e) => {
             e.preventDefault();
@@ -484,9 +466,7 @@ export default function PdfEditor() {
         >
           <FileUp size={40} className="text-blue-500" />
           <div>
-            <p className="text-lg font-semibold text-gray-800">
-              Drop PDF files here
-            </p>
+            <p className="text-lg font-semibold text-gray-800">Drop PDF files here</p>
             <p className="mt-1 text-sm text-gray-500">
               or click to browse — multiple files are merged in order
             </p>
@@ -497,15 +477,16 @@ export default function PdfEditor() {
             accept="application/pdf"
             multiple
             hidden
-            onChange={(e) =>
-              e.target.files && void loadFiles(Array.from(e.target.files))
-            }
+            onChange={(e) => e.target.files && void loadFiles(Array.from(e.target.files))}
           />
         </div>
       </div>
     );
   }
 
+  // =========================================================================
+  // Render — editor
+  // =========================================================================
   return (
     <div className="flex h-screen flex-col">
       {/* ===================== Toolbar ===================== */}
@@ -514,101 +495,48 @@ export default function PdfEditor() {
           {fileName}
         </span>
 
-        <ToolbarButton
-          icon={<FilePlus2 size={16} />}
-          label="Add PDF"
-          onClick={() => fileInputRef.current?.click()}
-        />
+        <ToolbarButton icon={<FilePlus2 size={16} />} label="Add PDF" onClick={() => fileInputRef.current?.click()} />
         <input
           ref={fileInputRef}
           type="file"
           accept="application/pdf"
           multiple
           hidden
-          onChange={(e) =>
-            e.target.files && void loadFiles(Array.from(e.target.files))
-          }
+          onChange={(e) => e.target.files && void loadFiles(Array.from(e.target.files))}
         />
-        <ToolbarButton
-          icon={<Type size={16} />}
-          label="Add Text"
-          onClick={addText}
-        />
-        <ToolbarButton
-          icon={<PenLine size={16} />}
-          label="Sign"
-          onClick={() => setShowSignatureModal(true)}
-        />
-        <ToolbarButton
-          icon={<Scissors size={16} />}
-          label="Split"
-          onClick={() => setShowSplitModal(true)}
-        />
+        <ToolbarButton icon={<Type size={16} />} label="Add Text" onClick={addText} />
+        <ToolbarButton icon={<PenLine size={16} />} label="Sign" onClick={() => setShowSignatureModal(true)} />
+        <ToolbarButton icon={<Scissors size={16} />} label="Split" onClick={() => setShowSplitModal(true)} />
 
         <div className="mx-3 h-5 w-px bg-gray-200" />
 
-        {/* ---- draw tools ---- */}
-        <ToolbarButton
-          icon={<Pencil size={16} />}
-          label="Draw"
-          active={drawTool === "pen"}
-          onClick={() => toggleDrawTool("pen")}
-        />
-        <ToolbarButton
-          icon={<Highlighter size={16} />}
-          label="Highlight"
-          active={drawTool === "highlighter"}
-          onClick={() => toggleDrawTool("highlighter")}
-        />
-        <ToolbarButton
-          icon={<Eraser size={16} />}
-          label=""
-          active={drawTool === "eraser"}
-          onClick={() => toggleDrawTool("eraser")}
-        />
+        {/* draw tools */}
+        <ToolbarButton icon={<Pencil size={16} />} label="Draw" active={drawTool === "pen"} onClick={() => toggleDrawTool("pen")} />
+        <ToolbarButton icon={<Highlighter size={16} />} label="Highlight" active={drawTool === "highlighter"} onClick={() => toggleDrawTool("highlighter")} />
+        <ToolbarButton icon={<Eraser size={16} />} label="" active={drawTool === "eraser"} onClick={() => toggleDrawTool("eraser")} />
+
         {(drawTool === "pen" || drawTool === "highlighter") && (
           <div className="ml-1 flex items-center gap-1.5">
             {(drawTool === "pen" ? PEN_COLORS : HIGHLIGHT_COLORS).map((c) => {
               const current = drawTool === "pen" ? penColor : highlightColor;
-              const setColor =
-                drawTool === "pen" ? setPenColor : setHighlightColor;
+              const setColor = drawTool === "pen" ? setPenColor : setHighlightColor;
               return (
-                <button
-                  key={c}
-                  type="button"
-                  onClick={() => setColor(c)}
-                  className={`h-5 w-5 rounded-full border-2 ${
-                    current === c ? "border-blue-500" : "border-transparent"
-                  }`}
+                <button key={c} type="button" onClick={() => setColor(c)}
+                  className={`h-5 w-5 rounded-full border-2 ${current === c ? "border-blue-500" : "border-transparent"}`}
                   style={{ backgroundColor: c }}
                 />
               );
             })}
-
-            {/* stroke width slider */}
             <input
               type="range"
               title="Stroke width"
-              min={
-                drawTool === "pen"
-                  ? PEN_WIDTH_RANGE.min
-                  : HIGHLIGHT_WIDTH_RANGE.min
-              }
-              max={
-                drawTool === "pen"
-                  ? PEN_WIDTH_RANGE.max
-                  : HIGHLIGHT_WIDTH_RANGE.max
-              }
+              min={drawTool === "pen" ? PEN_WIDTH_RANGE.min : HIGHLIGHT_WIDTH_RANGE.min}
+              max={drawTool === "pen" ? PEN_WIDTH_RANGE.max : HIGHLIGHT_WIDTH_RANGE.max}
               step={1}
               value={drawTool === "pen" ? penWidth : highlightWidth}
-              onChange={(e) =>
-                (drawTool === "pen" ? setPenWidth : setHighlightWidth)(
-                  Number(e.target.value)
-                )
-              }
+              onChange={(e) => (drawTool === "pen" ? setPenWidth : setHighlightWidth)(Number(e.target.value))}
               className="ml-2 h-1 w-20 cursor-pointer accent-blue-600"
             />
-            {/* live preview dot */}
             <span className="flex w-7 items-center justify-center">
               <span
                 className="rounded-full"
@@ -625,46 +553,37 @@ export default function PdfEditor() {
 
         <div className="mx-3 h-5 w-px bg-gray-200" />
 
-        {/* ---- undo / redo ---- */}
-        <ToolbarButton
-          icon={<Undo2 size={16} />}
-          label=""
-          title="Undo (Ctrl+Z)"
-          disabled={!canUndo}
-          onClick={undo}
-        />
-        <ToolbarButton
-          icon={<Redo2 size={16} />}
-          label=""
-          title="Redo (Ctrl+Y / Ctrl+Shift+Z)"
-          disabled={!canRedo}
-          onClick={redo}
-        />
+        {/* undo / redo */}
+        <ToolbarButton icon={<Undo2 size={16} />} label="" title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={undo} />
+        <ToolbarButton icon={<Redo2 size={16} />} label="" title="Redo (Ctrl+Y)" disabled={!canRedo} onClick={redo} />
 
         <div className="mx-3 h-5 w-px bg-gray-200" />
 
-        <ToolbarButton
-          icon={<ZoomOut size={16} />}
-          label=""
-          onClick={() =>
-            setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)))
-          }
-        />
-        <span className="w-12 text-center text-xs tabular-nums text-gray-500">
-          {Math.round(zoom * 100)}%
-        </span>
-        <ToolbarButton
-          icon={<ZoomIn size={16} />}
-          label=""
-          onClick={() =>
-            setZoom((z) => Math.min(3, +(z + 0.25).toFixed(2)))
-          }
-        />
+        {/* zoom */}
+        <ToolbarButton icon={<ZoomOut size={16} />} label="" onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)))} />
+        <span className="w-12 text-center text-xs tabular-nums text-gray-500">{Math.round(zoom * 100)}%</span>
+        <ToolbarButton icon={<ZoomIn size={16} />} label="" onClick={() => setZoom((z) => Math.min(3, +(z + 0.25).toFixed(2)))} />
 
         <div className="flex-1" />
-        {isBusy && (
-          <Loader2 size={16} className="mr-2 animate-spin text-blue-500" />
+
+        {/* autosave indicator */}
+        {saveStatus === "saving" && (
+          <span className="mr-2 flex items-center gap-1 text-xs text-gray-400">
+            <Loader2 size={13} className="animate-spin" /> Saving…
+          </span>
         )}
+        {saveStatus === "saved" && (
+          <span className="mr-2 flex items-center gap-1 text-xs text-green-600">
+            <CheckCircle2 size={13} /> Saved
+          </span>
+        )}
+        {saveStatus === "error" && (
+          <span className="mr-2 flex items-center gap-1 text-xs text-red-500" title="Autosave failed">
+            <AlertCircle size={13} /> Save failed
+          </span>
+        )}
+
+        {isBusy && <Loader2 size={16} className="mr-2 animate-spin text-blue-500" />}
         <button
           type="button"
           onClick={finalizeAndDownload}
@@ -677,12 +596,8 @@ export default function PdfEditor() {
 
       <div className="flex min-h-0 flex-1">
         {/* ===================== Thumbnail sidebar ===================== */}
-        <aside
-          className={`shrink-0 border-r border-gray-200 bg-white transition-all duration-200 ${
-            sidebarOpen ? "w-40" : "w-9"
-          }`}
-        >
-          {/* header row: page count + collapse toggle */}
+        <aside className={`shrink-0 border-r border-gray-200 bg-white transition-all duration-200 ${sidebarOpen ? "w-40" : "w-9"}`}>
+          {/* header */}
           <div className="flex h-8 items-center justify-between border-b border-gray-100 px-2">
             {sidebarOpen && (
               <span className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">
@@ -695,48 +610,29 @@ export default function PdfEditor() {
               onClick={() => setSidebarOpen((o) => !o)}
               className="ml-auto rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
             >
-              {sidebarOpen ? (
-                <PanelLeftClose size={15} />
-              ) : (
-                <PanelLeftOpen size={15} />
-              )}
+              {sidebarOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
             </button>
           </div>
 
-          {/* thumbnail list */}
+          {/* thumbnails */}
           {sidebarOpen && (
             <div className="h-[calc(100%-2rem)] overflow-y-auto p-3">
               <Document file={documentFile} loading={null}>
                 {Array.from({ length: numPages }, (_, i) => {
-                  const isDraggingOver =
-                    thumbOverIdx === i && dragPageIdx.current !== i;
+                  const isDraggingOver = thumbOverIdx === i && dragPageIdx.current !== i;
                   return (
                     <div
                       key={`thumb-${i}`}
-                      ref={(el) => {
-                        thumbRefs.current[i] = el;
-                      }}
+                      ref={(el) => { thumbRefs.current[i] = el; }}
                       draggable
-                      onDragStart={(e) => {
-                        dragPageIdx.current = i;
-                        e.dataTransfer.effectAllowed = "move";
-                      }}
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = "move";
-                        if (thumbOverIdx !== i) setThumbOverIdx(i);
-                      }}
-                      onDragLeave={() => {
-                        if (thumbOverIdx === i) setThumbOverIdx(null);
-                      }}
+                      onDragStart={(e) => { dragPageIdx.current = i; e.dataTransfer.effectAllowed = "move"; }}
+                      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (thumbOverIdx !== i) setThumbOverIdx(i); }}
+                      onDragLeave={() => { if (thumbOverIdx === i) setThumbOverIdx(null); }}
                       onDrop={(e) => {
                         e.preventDefault();
                         const from = dragPageIdx.current;
                         if (from !== null && from !== i) {
-                          const order = Array.from(
-                            { length: numPages },
-                            (_, x) => x
-                          );
+                          const order = Array.from({ length: numPages }, (_, x) => x);
                           order.splice(from, 1);
                           order.splice(i, 0, from);
                           void reorderPages(order);
@@ -744,51 +640,56 @@ export default function PdfEditor() {
                         dragPageIdx.current = null;
                         setThumbOverIdx(null);
                       }}
-                      onDragEnd={() => {
-                        dragPageIdx.current = null;
-                        setThumbOverIdx(null);
-                      }}
+                      onDragEnd={() => { dragPageIdx.current = null; setThumbOverIdx(null); }}
                       className={`group relative mb-3 cursor-grab rounded border-2 transition-opacity active:cursor-grabbing ${
-                        activePage === i
-                          ? "border-blue-500"
-                          : "border-transparent hover:border-blue-200"
-                      } ${
-                        isDraggingOver
-                          ? "border-t-4 border-t-blue-500 opacity-80"
-                          : ""
-                      }`}
+                        activePage === i ? "border-blue-500" : "border-transparent hover:border-blue-200"
+                      } ${isDraggingOver ? "border-t-4 border-t-blue-500 opacity-80" : ""}`}
                       onClick={() => {
                         setActivePage(i);
-                        document
-                          .getElementById(`pdf-page-${i}`)
-                          ?.scrollIntoView({
-                            behavior: "smooth",
-                            block: "start",
-                          });
+                        document.getElementById(`pdf-page-${i}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
                       }}
                     >
-                      <Page
-                        pageIndex={i}
-                        width={THUMB_WIDTH}
-                        renderTextLayer={false}
-                        renderAnnotationLayer={false}
-                      />
+                      <Page pageIndex={i} width={THUMB_WIDTH} renderTextLayer={false} renderAnnotationLayer={false} />
+
+                      {/* page number badge */}
                       <span className="absolute bottom-1 left-1 rounded bg-gray-900/70 px-1.5 text-[10px] text-white">
                         {i + 1}
                       </span>
-                      {numPages > 1 && (
-                        <button
-                          type="button"
-                          title="Delete page"
-                          className="absolute right-1 top-1 hidden rounded bg-red-600 p-1 text-white group-hover:block"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void deletePage(i);
-                          }}
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      )}
+
+                      {/* hover controls */}
+                      <div className="absolute inset-x-0 top-1 hidden items-center justify-between px-1 group-hover:flex">
+                        {/* rotate buttons */}
+                        <div className="flex gap-0.5">
+                          <button
+                            type="button"
+                            title="Rotate left"
+                            className="rounded bg-gray-900/70 p-0.5 text-white hover:bg-gray-900"
+                            onClick={(e) => { e.stopPropagation(); void rotatePage(i, -90); }}
+                          >
+                            <RotateCcw size={11} />
+                          </button>
+                          <button
+                            type="button"
+                            title="Rotate right"
+                            className="rounded bg-gray-900/70 p-0.5 text-white hover:bg-gray-900"
+                            onClick={(e) => { e.stopPropagation(); void rotatePage(i, 90); }}
+                          >
+                            <RotateCw size={11} />
+                          </button>
+                        </div>
+
+                        {/* delete button */}
+                        {numPages > 1 && (
+                          <button
+                            type="button"
+                            title="Delete page"
+                            className="rounded bg-red-600 p-0.5 text-white hover:bg-red-700"
+                            onClick={(e) => { e.stopPropagation(); void deletePage(i); }}
+                          >
+                            <Trash2 size={11} />
+                          </button>
+                        )}
+                      </div>
                     </div>
                   );
                 })}
@@ -798,18 +699,11 @@ export default function PdfEditor() {
         </aside>
 
         {/* ===================== Main canvas ===================== */}
-        <main
-          className="flex-1 overflow-auto p-8"
-          onClick={() => setSelectedId(null)}
-        >
+        <main className="flex-1 overflow-auto p-8" onClick={() => setSelectedId(null)}>
           <Document
             file={documentFile}
             onLoadSuccess={({ numPages: n }) => setNumPages(n)}
-            loading={
-              <div className="flex justify-center pt-20 text-gray-400">
-                Rendering…
-              </div>
-            }
+            loading={<div className="flex justify-center pt-20 text-gray-400">Rendering…</div>}
           >
             {Array.from({ length: numPages }, (_, i) => {
               const dims = pageDims[i];
@@ -821,15 +715,9 @@ export default function PdfEditor() {
                   key={`page-${i}`}
                   id={`pdf-page-${i}`}
                   className={`relative mx-auto mb-6 w-fit bg-white shadow-md ${
-                    activePage === i
-                      ? "outline outline-2 outline-blue-300"
-                      : ""
+                    activePage === i ? "outline outline-2 outline-blue-300" : ""
                   }`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setActivePage(i);
-                    setSelectedId(null);
-                  }}
+                  onClick={(e) => { e.stopPropagation(); setActivePage(i); setSelectedId(null); }}
                 >
                   <Page
                     pageIndex={i}
@@ -838,19 +726,10 @@ export default function PdfEditor() {
                     renderAnnotationLayer={false}
                     onLoadSuccess={(page) => {
                       setPageDims((prev) =>
-                        prev[i]
-                          ? prev
-                          : {
-                              ...prev,
-                              [i]: {
-                                width: page.originalWidth,
-                                height: page.originalHeight,
-                              },
-                            }
+                        prev[i] ? prev : { ...prev, [i]: { width: page.originalWidth, height: page.originalHeight } }
                       );
                     }}
                   />
-                  {/* Freehand ink layer */}
                   {dims && (
                     <DrawingLayer
                       pageIndex={i}
@@ -861,19 +740,10 @@ export default function PdfEditor() {
                       strokeWidth={strokeStyle.width}
                       opacity={strokeStyle.opacity}
                       blend={strokeStyle.blend}
-                      onAddStroke={(s) => {
-                        pushHistory();
-                        setStrokes((prev) => [...prev, s]);
-                      }}
-                      onDeleteStroke={(id) => {
-                        pushHistory();
-                        setStrokes((prev) =>
-                          prev.filter((s) => s.id !== id)
-                        );
-                      }}
+                      onAddStroke={(s) => { pushHistory(); setStrokes((prev) => [...prev, s]); }}
+                      onDeleteStroke={(id) => { pushHistory(); setStrokes((prev) => prev.filter((s) => s.id !== id)); }}
                     />
                   )}
-                  {/* Draggable annotation layer */}
                   {dims &&
                     annotations
                       .filter((a) => a.pageIndex === i)
@@ -899,10 +769,7 @@ export default function PdfEditor() {
       {showSignatureModal && (
         <SignatureModal
           onClose={() => setShowSignatureModal(false)}
-          onConfirm={(dataUrl, aspect) => {
-            addSignature(dataUrl, aspect);
-            setShowSignatureModal(false);
-          }}
+          onConfirm={(dataUrl, aspect) => { addSignature(dataUrl, aspect); setShowSignatureModal(false); }}
         />
       )}
       {showSplitModal && (
@@ -918,12 +785,7 @@ export default function PdfEditor() {
 }
 
 function ToolbarButton({
-  icon,
-  label,
-  title,
-  onClick,
-  active = false,
-  disabled = false,
+  icon, label, title, onClick, active = false, disabled = false,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -939,9 +801,7 @@ function ToolbarButton({
       disabled={disabled}
       title={title}
       className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-35 ${
-        active
-          ? "bg-blue-100 text-blue-700"
-          : "text-gray-700 hover:bg-gray-100"
+        active ? "bg-blue-100 text-blue-700" : "text-gray-700 hover:bg-gray-100"
       }`}
     >
       {icon}
