@@ -46,6 +46,17 @@ const AUTOSAVE_DELAY_MS = 1500;
 
 const PEN_COLORS = ["#111827", "#1d4ed8", "#b91c1c"];
 const HIGHLIGHT_COLORS = ["#facc15", "#4ade80", "#f472b6"];
+
+/** Human-readable names used for aria-label on colour swatches. */
+const COLOR_NAMES: Record<string, string> = {
+  "#111827": "Black",
+  "#1d4ed8": "Blue",
+  "#b91c1c": "Red",
+  "#facc15": "Yellow",
+  "#4ade80": "Green",
+  "#f472b6": "Pink",
+  "#15803d": "Dark green",
+};
 const PEN_WIDTH_RANGE = { min: 1, max: 10, default: 2 };
 const HIGHLIGHT_WIDTH_RANGE = { min: 6, max: 24, default: 12 };
 
@@ -537,7 +548,11 @@ export default function PdfEditor() {
   return (
     <div className="flex h-screen flex-col">
       {/* ===================== Toolbar ===================== */}
-      <header className="z-30 flex items-center gap-1 border-b border-gray-200 bg-white px-3 py-2 shadow-sm">
+      <header
+        role="toolbar"
+        aria-label="PDF editor toolbar"
+        className="z-30 flex items-center gap-1 border-b border-gray-200 bg-white px-3 py-2 shadow-sm"
+      >
         <span className="mr-3 max-w-48 truncate text-sm font-semibold text-gray-700">
           {fileName}
         </span>
@@ -567,15 +582,22 @@ export default function PdfEditor() {
             {(drawTool === "pen" ? PEN_COLORS : HIGHLIGHT_COLORS).map((c) => {
               const current = drawTool === "pen" ? penColor : highlightColor;
               const setColor = drawTool === "pen" ? setPenColor : setHighlightColor;
+              const isActive = current === c;
               return (
-                <button key={c} type="button" onClick={() => setColor(c)}
-                  className={`h-5 w-5 rounded-full border-2 ${current === c ? "border-blue-500" : "border-transparent"}`}
+                <button
+                  key={c}
+                  type="button"
+                  aria-label={`${COLOR_NAMES[c] ?? c} stroke colour`}
+                  aria-pressed={isActive}
+                  onClick={() => setColor(c)}
+                  className={`h-5 w-5 rounded-full border-2 ${isActive ? "border-blue-500" : "border-transparent"}`}
                   style={{ backgroundColor: c }}
                 />
               );
             })}
             <input
               type="range"
+              aria-label="Stroke width"
               title="Stroke width"
               min={drawTool === "pen" ? PEN_WIDTH_RANGE.min : HIGHLIGHT_WIDTH_RANGE.min}
               max={drawTool === "pen" ? PEN_WIDTH_RANGE.max : HIGHLIGHT_WIDTH_RANGE.max}
@@ -613,22 +635,27 @@ export default function PdfEditor() {
 
         <div className="flex-1" />
 
-        {/* autosave indicator */}
-        {saveStatus === "saving" && (
-          <span className="mr-2 flex items-center gap-1 text-xs text-gray-400">
-            <Loader2 size={13} className="animate-spin" /> Saving…
-          </span>
-        )}
-        {saveStatus === "saved" && (
-          <span className="mr-2 flex items-center gap-1 text-xs text-green-600">
-            <CheckCircle2 size={13} /> Saved
-          </span>
-        )}
-        {saveStatus === "error" && (
-          <span className="mr-2 flex items-center gap-1 text-xs text-red-500" title="Autosave failed">
-            <AlertCircle size={13} /> Save failed
-          </span>
-        )}
+        {/* autosave indicator — role=status announces changes to screen readers */}
+        <div role="status" aria-live="polite" aria-atomic="true" className="mr-2">
+          {saveStatus === "saving" && (
+            <span className="flex items-center gap-1 text-xs text-gray-400">
+              <Loader2 size={13} className="animate-spin" aria-hidden="true" />
+              <span>Saving…</span>
+            </span>
+          )}
+          {saveStatus === "saved" && (
+            <span className="flex items-center gap-1 text-xs text-green-600">
+              <CheckCircle2 size={13} aria-hidden="true" />
+              <span>Saved</span>
+            </span>
+          )}
+          {saveStatus === "error" && (
+            <span className="flex items-center gap-1 text-xs text-red-500">
+              <AlertCircle size={13} aria-hidden="true" />
+              <span>Save failed</span>
+            </span>
+          )}
+        </div>
 
         {isBusy && <Loader2 size={16} className="mr-2 animate-spin text-blue-500" />}
         <button
@@ -662,11 +689,12 @@ export default function PdfEditor() {
             )}
             <button
               type="button"
+              aria-label={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
               title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
               onClick={() => setSidebarOpen((o) => !o)}
               className="ml-auto rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
             >
-              {sidebarOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
+              {sidebarOpen ? <PanelLeftClose size={15} aria-hidden="true" /> : <PanelLeftOpen size={15} aria-hidden="true" />}
             </button>
           </div>
 
@@ -674,12 +702,20 @@ export default function PdfEditor() {
           {sidebarOpen && (
             <div className="h-[calc(100%-2rem)] overflow-y-auto p-3">
               <Document file={documentFile} loading={null}>
+                {/* role="list" because CSS resets on <ul> would need extra work;
+                    a plain div with role="list" is the accessible equivalent. */}
+                <div role="list" aria-label="Pages">
                 {Array.from({ length: numPages }, (_, i) => {
                   const isDraggingOver = thumbOverIdx === i && dragPageIdx.current !== i;
                   return (
                     <div
                       key={`thumb-${i}`}
                       ref={(el) => { thumbRefs.current[i] = el; }}
+                      role="listitem"
+                      /* Make the thumb keyboard-focusable and announce it. */
+                      tabIndex={0}
+                      aria-label={`Page ${i + 1}${activePage === i ? ", current page" : ""}`}
+                      aria-current={activePage === i ? "true" : undefined}
                       draggable
                       onDragStart={(e) => { dragPageIdx.current = i; e.dataTransfer.effectAllowed = "move"; }}
                       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (thumbOverIdx !== i) setThumbOverIdx(i); }}
@@ -697,7 +733,28 @@ export default function PdfEditor() {
                         setThumbOverIdx(null);
                       }}
                       onDragEnd={() => { dragPageIdx.current = null; setThumbOverIdx(null); }}
-                      className={`group relative mb-3 cursor-grab rounded border-2 transition-opacity active:cursor-grabbing ${
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setActivePage(i);
+                          document.getElementById(`pdf-page-${i}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+                        } else if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+                          e.preventDefault();
+                          const next = Math.min(i + 1, numPages - 1);
+                          thumbRefs.current[next]?.focus();
+                        } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+                          e.preventDefault();
+                          const prev = Math.max(i - 1, 0);
+                          thumbRefs.current[prev]?.focus();
+                        } else if (e.key === "Home") {
+                          e.preventDefault();
+                          thumbRefs.current[0]?.focus();
+                        } else if (e.key === "End") {
+                          e.preventDefault();
+                          thumbRefs.current[numPages - 1]?.focus();
+                        }
+                      }}
+                      className={`group relative mb-3 cursor-grab rounded border-2 transition-opacity active:cursor-grabbing focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 ${
                         activePage === i ? "border-blue-500" : "border-transparent hover:border-blue-200"
                       } ${isDraggingOver ? "border-t-4 border-t-blue-500 opacity-80" : ""}`}
                       onClick={() => {
@@ -718,19 +775,21 @@ export default function PdfEditor() {
                         <div className="flex gap-0.5">
                           <button
                             type="button"
+                            aria-label={`Rotate page ${i + 1} left`}
                             title="Rotate left"
                             className="rounded bg-gray-900/70 p-0.5 text-white hover:bg-gray-900"
                             onClick={(e) => { e.stopPropagation(); void rotatePage(i, -90); }}
                           >
-                            <RotateCcw size={11} />
+                            <RotateCcw size={11} aria-hidden="true" />
                           </button>
                           <button
                             type="button"
+                            aria-label={`Rotate page ${i + 1} right`}
                             title="Rotate right"
                             className="rounded bg-gray-900/70 p-0.5 text-white hover:bg-gray-900"
                             onClick={(e) => { e.stopPropagation(); void rotatePage(i, 90); }}
                           >
-                            <RotateCw size={11} />
+                            <RotateCw size={11} aria-hidden="true" />
                           </button>
                         </div>
 
@@ -738,6 +797,7 @@ export default function PdfEditor() {
                         {numPages > 1 && (
                           <button
                             type="button"
+                            aria-label={`Delete page ${i + 1}`}
                             title="Delete page"
                             className="rounded bg-red-600 p-0.5 text-white hover:bg-red-700"
                             onClick={(e) => { e.stopPropagation(); void deletePage(i); }}
@@ -749,6 +809,7 @@ export default function PdfEditor() {
                     </div>
                   );
                 })}
+                </div>{/* end role="list" */}
               </Document>
             </div>
           )}
@@ -856,6 +917,12 @@ function ToolbarButton({
       onClick={onClick}
       disabled={disabled}
       title={title}
+      /* aria-label: prefer explicit title, fall back to label text */
+      aria-label={title ?? label ?? undefined}
+      /* aria-pressed marks stateful toggle buttons (draw/highlight/eraser).
+         Purely action buttons (zoom, undo…) pass active=false and won't
+         be announced as toggle buttons by screen readers. */
+      aria-pressed={active ? true : undefined}
       className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-35 ${
         active ? "bg-blue-100 text-blue-700" : "text-gray-700 hover:bg-gray-100"
       }`}

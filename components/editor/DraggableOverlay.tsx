@@ -6,7 +6,12 @@ import { Trash2, GripVertical, Minus, Plus } from "lucide-react";
 import type { Annotation } from "@/lib/types";
 import { ptToPx, pxToPt } from "@/lib/coords";
 
-const TEXT_COLORS = ["#111827", "#1d4ed8", "#b91c1c", "#15803d"];
+const TEXT_COLORS = [
+  { hex: "#111827", label: "Black" },
+  { hex: "#1d4ed8", label: "Blue" },
+  { hex: "#b91c1c", label: "Red" },
+  { hex: "#15803d", label: "Dark green" },
+];
 const FONT_SIZE = { min: 8, max: 96, step: 2 };
 
 interface DraggableOverlayProps {
@@ -99,6 +104,7 @@ export default function DraggableOverlay({
             <textarea
               ref={textareaRef}
               defaultValue={annotation.text}
+              aria-label="Edit annotation text"
               className="h-full w-full resize-none bg-white/70 p-0 leading-tight outline-none"
               style={{
                 fontSize: ptToPx(annotation.fontSize ?? 14, scale),
@@ -150,6 +156,7 @@ export default function DraggableOverlay({
               {/* font size stepper */}
               <button
                 type="button"
+                aria-label="Decrease font size"
                 title="Smaller text"
                 className="rounded p-0.5 text-gray-300 hover:bg-gray-700"
                 onClick={(e) => {
@@ -162,13 +169,14 @@ export default function DraggableOverlay({
                   });
                 }}
               >
-                <Minus size={12} />
+                <Minus size={12} aria-hidden="true" />
               </button>
-              <span className="w-6 text-center text-[11px] tabular-nums text-gray-200">
+              <span className="w-6 text-center text-[11px] tabular-nums text-gray-200" aria-label={`Font size ${annotation.fontSize ?? 14}`}>
                 {annotation.fontSize ?? 14}
               </span>
               <button
                 type="button"
+                aria-label="Increase font size"
                 title="Larger text"
                 className="rounded p-0.5 text-gray-300 hover:bg-gray-700"
                 onClick={(e) => {
@@ -181,37 +189,41 @@ export default function DraggableOverlay({
                   });
                 }}
               >
-                <Plus size={12} />
+                <Plus size={12} aria-hidden="true" />
               </button>
 
               <span className="mx-0.5 h-3.5 w-px bg-gray-700" />
 
               {/* text color swatches */}
-              {TEXT_COLORS.map((c) => (
-                <button
-                  key={c}
-                  type="button"
-                  title={c}
-                  className={`h-3.5 w-3.5 rounded-full border ${
-                    (annotation.color ?? "#111827") === c
-                      ? "border-white"
-                      : "border-transparent"
-                  }`}
-                  style={{ backgroundColor: c }}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onChange(annotation.id, { color: c });
-                  }}
-                />
-              ))}
+              {TEXT_COLORS.map((c) => {
+                const isActive = (annotation.color ?? "#111827") === c.hex;
+                return (
+                  <button
+                    key={c.hex}
+                    type="button"
+                    aria-label={`${c.label} text colour`}
+                    aria-pressed={isActive}
+                    title={c.label}
+                    className={`h-3.5 w-3.5 rounded-full border ${
+                      isActive ? "border-white" : "border-transparent"
+                    }`}
+                    style={{ backgroundColor: c.hex }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onChange(annotation.id, { color: c.hex });
+                    }}
+                  />
+                );
+              })}
 
               <span className="mx-0.5 h-3.5 w-px bg-gray-700" />
             </>
           )}
 
-          <GripVertical size={12} className="text-gray-400" />
+          <GripVertical size={12} className="text-gray-400" aria-hidden="true" />
           <button
             type="button"
+            aria-label="Delete annotation"
             title="Delete"
             className="rounded p-0.5 text-red-400 hover:bg-gray-700 hover:text-red-300"
             onClick={(e) => {
@@ -219,7 +231,7 @@ export default function DraggableOverlay({
               onDelete(annotation.id);
             }}
           >
-            <Trash2 size={13} />
+            <Trash2 size={13} aria-hidden="true" />
           </button>
         </div>
       </div>
