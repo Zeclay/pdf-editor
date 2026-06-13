@@ -70,6 +70,10 @@ export default function PdfEditor() {
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ---- page reorder drag state ----
+  const dragPageIdx = useRef<number | null>(null);
+  const [thumbOverIdx, setThumbOverIdx] = useState<number | null>(null);
+
   // ---- freehand drawing state ----
   const [strokes, setStrokes] = useState<InkStroke[]>([]);
   const [drawTool, setDrawTool] = useState<DrawTool | null>(null);
@@ -184,6 +188,42 @@ export default function PdfEditor() {
       }
     },
     [pdfBytes, numPages]
+  );
+
+  // =====================================================================
+  // Page reorder
+  // =====================================================================
+  const reorderPages = useCallback(
+    async (newOrder: number[]) => {
+      if (!pdfBytes) return;
+      setIsBusy(true);
+      try {
+        // extractPages already accepts indices in any order — pass the new
+        // order directly to rebuild the PDF with pages in that sequence.
+        const bytes = await extractPages(pdfBytes, newOrder);
+        setNumPages(0);
+        setPdfBytes(bytes);
+        setPageDims({});
+        // Remap: newPageIndex = newOrder.indexOf(oldPageIndex)
+        setAnnotations((prev) =>
+          prev
+            .map((a) => ({ ...a, pageIndex: newOrder.indexOf(a.pageIndex) }))
+            .filter((a) => a.pageIndex !== -1)
+        );
+        setStrokes((prev) =>
+          prev
+            .map((s) => ({ ...s, pageIndex: newOrder.indexOf(s.pageIndex) }))
+            .filter((s) => s.pageIndex !== -1)
+        );
+        setActivePage((p) => {
+          const next = newOrder.indexOf(p);
+          return next === -1 ? 0 : next;
+        });
+      } finally {
+        setIsBusy(false);
+      }
+    },
+    [pdfBytes]
   );
 
   // =====================================================================
@@ -510,45 +550,79 @@ export default function PdfEditor() {
         {/* ================= Thumbnail sidebar ================= */}
         <aside className="w-40 shrink-0 overflow-y-auto border-r border-gray-200 bg-white p-3">
           <Document file={documentFile} loading={null}>
-            {Array.from({ length: numPages }, (_, i) => (
-              <div
-                key={`thumb-${i}`}
-                className={`group relative mb-3 cursor-pointer rounded border-2 ${
-                  activePage === i
-                    ? "border-blue-500"
-                    : "border-transparent hover:border-blue-200"
-                }`}
-                onClick={() => {
-                  setActivePage(i);
-                  document
-                    .getElementById(`pdf-page-${i}`)
-                    ?.scrollIntoView({ behavior: "smooth", block: "start" });
-                }}
-              >
-                <Page
-                  pageIndex={i}
-                  width={THUMB_WIDTH}
-                  renderTextLayer={false}
-                  renderAnnotationLayer={false}
-                />
-                <span className="absolute bottom-1 left-1 rounded bg-gray-900/70 px-1.5 text-[10px] text-white">
-                  {i + 1}
-                </span>
-                {numPages > 1 && (
-                  <button
-                    type="button"
-                    title="Delete page"
-                    className="absolute right-1 top-1 hidden rounded bg-red-600 p-1 text-white group-hover:block"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void deletePage(i);
-                    }}
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                )}
-              </div>
-            ))}
+            {Array.from({ length: numPages }, (_, i) => {
+              const isDraggingOver =
+                thumbOverIdx === i && dragPageIdx.current !== i;
+              return (
+                <div
+                  key={`thumb-${i}`}
+                  draggable
+                  onDragStart={(e) => {
+                    dragPageIdx.current = i;
+                    // ghost image is the thumbnail itself — default is fine
+                    e.dataTransfer.effectAllowed = "move";
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    if (thumbOverIdx !== i) setThumbOverIdx(i);
+                  }}
+                  onDragLeave={() => {
+                    if (thumbOverIdx === i) setThumbOverIdx(null);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const from = dragPageIdx.current;
+                    if (from !== null && from !== i) {
+                      const order = Array.from({ length: numPages }, (_, x) => x);
+                      order.splice(from, 1);
+                      order.splice(i, 0, from);
+                      void reorderPages(order);
+                    }
+                    dragPageIdx.current = null;
+                    setThumbOverIdx(null);
+                  }}
+                  onDragEnd={() => {
+                    dragPageIdx.current = null;
+                    setThumbOverIdx(null);
+                  }}
+                  className={`group relative mb-3 cursor-grab rounded border-2 transition-opacity active:cursor-grabbing ${
+                    activePage === i
+                      ? "border-blue-500"
+                      : "border-transparent hover:border-blue-200"
+                  } ${isDraggingOver ? "border-t-4 border-t-blue-500 opacity-80" : ""}`}
+                  onClick={() => {
+                    setActivePage(i);
+                    document
+                      .getElementById(`pdf-page-${i}`)
+                      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+                  }}
+                >
+                  <Page
+                    pageIndex={i}
+                    width={THUMB_WIDTH}
+                    renderTextLayer={false}
+                    renderAnnotationLayer={false}
+                  />
+                  <span className="absolute bottom-1 left-1 rounded bg-gray-900/70 px-1.5 text-[10px] text-white">
+                    {i + 1}
+                  </span>
+                  {numPages > 1 && (
+                    <button
+                      type="button"
+                      title="Delete page"
+                      className="absolute right-1 top-1 hidden rounded bg-red-600 p-1 text-white group-hover:block"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void deletePage(i);
+                      }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
           </Document>
         </aside>
 
